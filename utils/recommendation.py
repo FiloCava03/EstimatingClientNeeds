@@ -1,250 +1,243 @@
 """
 recommendation.py
 =================
-Next Best Action (NBA) engine for the Needs-based investment product
-recommendation system.
+Next Best Action (NBA) engine per il pipeline Decision Tree.
+
+match_best_product() e' condivisa con il notebook NN (stessa logica di
+matching MiFID). Tutto il resto usa l'interfaccia sklearn del DT:
+predict_proba() su feature non scalate, soglia fissa 0.5.
 
 Pipeline
 --------
-1. compute_score        – MiFID-compliant composite score for one client-product pair
-2. generate_recommendations – top-K product recommendations for every client
-3. analyse_coverage     – catalogue-gap decomposition (correct silence vs gap)
-
-Design principles
------------------
-* Regulatory compliance is a HARD gate (ComplianceMask = 0 → score = 0).
-  No ML score can override a MiFID suitability constraint.
-
-Reproducibility note
---------------------
-Any random values used in the NBA pipeline (e.g. mock Utility scores)
-must be generated with np.random.default_rng(seed) — a PRIVATE Generator
-fully isolated from the global numpy random state.
-Using np.random.seed() + np.random.uniform() is fragile: the number of
-internal RNG draws inside sklearn / Optuna helpers can differ between code
-versions, silently shifting the global state and changing results even
-when the same seed is set.  default_rng() is immune to this.
-* Suitability is a SOFT preference: a Gaussian centred on the client's
-  RiskPropensity rewards products whose risk matches the client's tolerance
-  without penalising modest mismatches too harshly.
-* Business utility is a secondary weight so that, among equally suitable
-  products, the firm can prefer higher-margin offerings — but only after
-  regulatory and need filters are satisfied.
+1. match_best_product()      -- regola MiFID: prodotto piu' rischioso ancora compliance
+2. generate_recommendations() -- applica la regola a tutti i clienti con DT proba
+3. analyse_coverage()        -- scompone clienti in silence / covered / gap
+4. plot_nba_diagnostics()    -- scatter suitability + frequency bar
+5. print_top_products()      -- top-k prodotti per head
 """
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 
 # ---------------------------------------------------------------------------
-# Single client-product scoring
+# Matching rule — condivisa con notebook NN (logica identica)
 # ---------------------------------------------------------------------------
 
-def compute_score(
-    p_need:      float,
-    client_risk: float,
-    product_row: pd.Series,
-    owned_set:   set
-) -> float:
+def match_best_product(client_risk: float, catalogue: pd.DataFrame):
     """
-    Composite MiFID-compliant score for recommending one product to one client.
+    Seleziona il prodotto con il risk piu' alto ancora compliance.
 
-    Formula:   Score = P(need) × Suitability × Utility × ComplianceMask
+    Regola MiFID: product_risk <= client_risk.
+    Tra tutti i prodotti ammissibili prende quello che massimizza il risk,
+    cioe' il piu' adatto al profilo del cliente senza violare i limiti.
 
-    ComplianceMask (hard gate — any breach → score = 0)
-    ---------------------------------------------------
-    * Risk breach:   product_risk > client_risk + 0.05
-                     The 0.05 tolerance avoids rejecting a product that is
-                     only marginally above the client's propensity due to
-                     rounding in the data.
-    * Already owned: product is in owned_set (no re-recommendation).
-
-    Suitability (soft preference)
-    ------------------------------
-    Gaussian: exp(−3 × (product_risk − client_risk)²)
-    Peaks at 1.0 when product_risk == client_risk, decays smoothly as the
-    gap widens.  This prevents systematically pushing low-risk clients to
-    the cheapest product and high-risk clients to the most aggressive one.
+    Questa funzione e' identica a quella usata nel notebook NN — non dipende
+    ne' dal tipo di modello ne' dalla pipeline di scaling.
 
     Parameters
     ----------
-    p_need       : float  calibrated P(client needs this product type)
-    client_risk  : float  client's RiskPropensity in [0, 1]
-    product_row  : pd.Series  one row from products_df (needs 'Risk', 'Type',
-                  'IDProduct', 'Utility')
-    owned_set    : set    product IDs already held by this client
+    client_risk : float  RiskPropensity del cliente in [0, 1]
+    catalogue   : pd.DataFrame  subset di products_df filtrato per Type
+                  (solo accum o solo income), colonne IDProduct e Risk
 
     Returns
     -------
-    float — composite score (0 if any hard constraint is violated)
+    (product_id, product_risk) : (int, float)
+    oppure (None, None) se nessun prodotto e' compliance (catalogue gap)
     """
-    product_risk = float(product_row['Risk'])
-    product_id   = product_row['IDProduct']
-    utility      = float(product_row.get('Utility', 1.0))
-
-    # ── Hard MiFID gate ──────────────────────────────────────────────────
-    if product_risk > client_risk + 0.05:
-        return 0.0   # risk breach: never recommend this product to this client
-
-    if product_id in owned_set:
-        return 0.0   # client already owns it: no value in re-recommending
-
-    # ── Soft suitability score ────────────────────────────────────────────
-    # Gaussian centred on the client's own risk tolerance.
-    # sigma is implicit in the coefficient 3; larger = narrower peak.
-    gap         = product_risk - client_risk
-    suitability = float(np.exp(-3.0 * gap ** 2))
-
-    # ── Composite score ───────────────────────────────────────────────────
-    return p_need * suitability * utility
+    eligible = catalogue[catalogue['Risk'] <= client_risk + 1e-9]
+    if eligible.empty:
+        return None, None
+    best = eligible.loc[eligible['Risk'].idxmax()]
+    return int(best['IDProduct']), float(best['Risk'])
 
 
 # ---------------------------------------------------------------------------
-# Batch recommendation generator
+# Batch NBA — specifica DT
 # ---------------------------------------------------------------------------
 
 def generate_recommendations(
-    needs_df:     pd.DataFrame,
-    products_df:  pd.DataFrame,
-    p_inc_all:    np.ndarray,
-    p_acc_all:    np.ndarray,
-    owned_lookup: dict = None,
-    top_k:        int  = 3
+    needs_df:    pd.DataFrame,
+    products_df: pd.DataFrame,
+    model_acc,                   # sklearn classifier per need Accumulation
+    model_inc,                   # sklearn classifier per need Income
+    X_features:  pd.DataFrame,   # feature NON scalate (DT invariante a scaling)
+    thr_acc:     float = 0.5,
+    thr_inc:     float = 0.5,
 ) -> pd.DataFrame:
     """
-    Generate up to top_k MiFID-compliant product recommendations for every client.
+    Genera una raccomandazione per ogni cliente usando i modelli DT.
 
-    For each client:
-      1. For each product, select P(need) based on the product's type:
-           Type = 1 (accumulation) → p_acc_all[i]
-           Type = 0 (income)       → p_inc_all[i]
-      2. Compute the composite score.
-      3. Rank products by score descending; keep top_k.
-      4. Pad with (None, 0.0) if fewer than top_k products pass the hard gate.
+    Differenze rispetto alla NBA del notebook NN:
+    - Le probabilita' vengono da predict_proba() sklearn, non da sigmoid(logits)
+    - Le feature NON sono scalate (i DT sono invarianti a trasformazioni monotone)
+    - Non c'e' calibrazione Platt (il DT e' gia' abbastanza calibrato dopo Optuna)
+    - La soglia e' 0.5 di default; puo' essere ottimizzata con best_threshold()
+      di NN/calibration.py se si vuole allineare alla pipeline NN
 
     Parameters
     ----------
-    needs_df     : original client DataFrame (used for RiskPropensity and count)
-    products_df  : product catalogue with columns IDProduct, Type, Risk, Utility
-    p_inc_all    : (n_clients,) array of P(income need) for every client
-    p_acc_all    : (n_clients,) array of P(accumulation need) for every client
-    owned_lookup : dict {client_index → set(product_ids already owned)}
-                   defaults to empty dict (no existing holdings assumed)
-    top_k        : number of recommendations to return per client (default 3)
+    needs_df    : DataFrame originale (serve solo RiskPropensity)
+    products_df : catalogo prodotti con colonne IDProduct, Type, Risk
+    model_acc   : DT fittato per predire AccumulationInvestment
+    model_inc   : DT fittato per predire IncomeInvestment
+    X_features  : feature matrix (n_clients, n_features), NON scalata
+    thr_acc     : soglia probabilita' per classificare need accum
+    thr_inc     : soglia probabilita' per classificare need income
 
     Returns
     -------
-    pd.DataFrame with columns:
-        ClientIdx, Rec_1, Score_1, Rec_2, Score_2, ..., Rec_{k}, Score_{k}
+    pd.DataFrame con colonne:
+        ClientID, ClientRisk, P_Accum, P_Income,
+        NeedAccum, NeedIncome,
+        Rec_Accum_ID, Rec_Accum_Risk,
+        Rec_Income_ID, Rec_Income_Risk
     """
-    if owned_lookup is None:
-        owned_lookup = {}
+    # Probabilita' dirette dal DT — nessuno scaling, nessuna calibrazione
+    p_acc_all = model_acc.predict_proba(X_features)[:, 1]
+    p_inc_all = model_inc.predict_proba(X_features)[:, 1]
+
+    need_acc = p_acc_all >= thr_acc
+    need_inc = p_inc_all >= thr_inc
+
+    # Separa catalogo per tipo — fatto una volta sola fuori dal loop
+    accum_products  = products_df[products_df['Type'] == 1].reset_index(drop=True)
+    income_products = products_df[products_df['Type'] == 0].reset_index(drop=True)
 
     client_risks = needs_df['RiskPropensity'].values
     rows = []
 
     for i in range(len(needs_df)):
-        owned  = owned_lookup.get(i, set())
-        scores = []
+        cr    = client_risks[i]
+        rec_a = match_best_product(cr, accum_products)  if need_acc[i] else (None, None)
+        rec_i = match_best_product(cr, income_products) if need_inc[i] else (None, None)
 
-        for _, prod in products_df.iterrows():
-            # Route to the correct need probability based on product type
-            p_need = p_acc_all[i] if prod['Type'] == 1 else p_inc_all[i]
-            s = compute_score(p_need, client_risks[i], prod, owned)
-            if s > 0:
-                scores.append((int(prod['IDProduct']), round(s, 4)))
-
-        # Sort descending by score and pad to top_k with (None, 0.0)
-        scores.sort(key=lambda x: x[1], reverse=True)
-        scores += [(None, 0.0)] * (top_k - len(scores))
-
-        row = {'ClientIdx': i}
-        for rank in range(top_k):
-            row[f'Rec_{rank+1}']   = scores[rank][0]
-            row[f'Score_{rank+1}'] = scores[rank][1]
-        rows.append(row)
+        rows.append({
+            'ClientID'        : i + 1,
+            'ClientRisk'      : round(float(cr), 4),
+            'P_Accum'         : round(float(p_acc_all[i]), 4),
+            'P_Income'        : round(float(p_inc_all[i]), 4),
+            'NeedAccum'       : bool(need_acc[i]),
+            'NeedIncome'      : bool(need_inc[i]),
+            'Rec_Accum_ID'    : rec_a[0],
+            'Rec_Accum_Risk'  : rec_a[1],
+            'Rec_Income_ID'   : rec_i[0],
+            'Rec_Income_Risk' : rec_i[1],
+        })
 
     return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
-# Coverage analysis
+# Coverage decomposition
 # ---------------------------------------------------------------------------
 
-def analyse_coverage(
-    needs_df:      pd.DataFrame,
-    recs_df:       pd.DataFrame,
-    p_inc_all:     np.ndarray,
-    p_acc_all:     np.ndarray,
-    need_threshold: float = 0.5
-) -> pd.DataFrame:
+def analyse_coverage(nba: pd.DataFrame) -> pd.DataFrame:
     """
-    Decompose clients with no recommendation into two distinct buckets:
+    Scompone i clienti in tre segmenti mutuamente esclusivi:
 
-    (a) Correct silence — the model predicted no need above the threshold.
-        Under MiFID/IDD, NOT recommending when there is no need is compliant
-        and correct behaviour.  Do NOT act on this segment.
-
-    (b) Catalogue gap — the model DID predict a need, but no compliant product
-        exists in the current catalogue for this client's risk tolerance.
-        This is a PRODUCT LINE OPPORTUNITY: the product team should consider
-        adding suitable instruments for this risk segment.
+    1. Correct silence  — modello non ha previsto nessun need (MiFID compliant).
+    2. Covered          — almeno una raccomandazione emessa.
+    3. Catalogue gap    — need previsto ma nessun prodotto compliance disponibile.
+                          Segnale per il product team, non errore del modello.
 
     Parameters
     ----------
-    needs_df        : client DataFrame
-    recs_df         : recommendations DataFrame (from generate_recommendations)
-    p_inc_all       : (n_clients,) income-need probabilities
-    p_acc_all       : (n_clients,) accumulation-need probabilities
-    need_threshold  : probability cut-off to classify a client as 'in need'
+    nba : DataFrame da generate_recommendations()
 
     Returns
     -------
-    pd.DataFrame summarising counts and percentages for the three segments
+    pd.DataFrame con Segment / Clients / Pct (%)
     """
-    n = len(needs_df)
+    covered_acc = nba['Rec_Accum_ID'].notna()
+    covered_inc = nba['Rec_Income_ID'].notna()
+    covered_any = covered_acc | covered_inc
 
-    # A client is 'in need' if either need exceeds the threshold
-    need_predicted = (p_acc_all >= need_threshold) | (p_inc_all >= need_threshold)
-    has_any_rec    = recs_df['Rec_1'].notna().values
+    gap_acc = nba['NeedAccum']  & ~covered_acc
+    gap_inc = nba['NeedIncome'] & ~covered_inc
+    silent  = ~nba['NeedAccum'] & ~nba['NeedIncome']
 
-    # Three mutually exclusive segments
-    no_need       = (~need_predicted) & (~has_any_rec)
-    catalogue_gap =  need_predicted   & (~has_any_rec)
-    covered       =  has_any_rec
-
+    n = len(nba)
     summary = pd.DataFrame({
         'Segment': [
             'No need predicted (correct silence)',
-            'Catalogue gap (need predicted, no compliant product)',
             'At least one recommendation emitted',
+            'Accumulation gap (need flagged, no compliant product)',
+            'Income gap (need flagged, no compliant product)',
         ],
-        'Clients': [
-            int(no_need.sum()),
-            int(catalogue_gap.sum()),
-            int(covered.sum()),
-        ],
-        'Pct (%)': [
-            round(no_need.mean() * 100, 1),
-            round(catalogue_gap.mean() * 100, 1),
-            round(covered.mean() * 100, 1),
-        ],
+        'Clients': [int(silent.sum()), int(covered_any.sum()),
+                    int(gap_acc.sum()),  int(gap_inc.sum())],
+        'Pct (%)': [round(silent.mean()*100, 1), round(covered_any.mean()*100, 1),
+                    round(gap_acc.mean()*100, 1),  round(gap_inc.mean()*100, 1)],
     })
 
-    # Per-need-type partial gaps (useful for the product team)
-    acc_gap = (p_acc_all >= need_threshold) & (~has_any_rec)
-    inc_gap = (p_inc_all >= need_threshold) & (~has_any_rec)
-
-    print('=== REFINED COVERAGE: why are some clients not covered? ===')
+    print('=== COVERAGE DECOMPOSITION ===')
     print(summary.to_string(index=False))
-    print(f'\nPartial catalogue gaps (per need head):')
-    print(f'  Accumulation need predicted but NO compatible product: '
-          f'{int(acc_gap.sum())}')
-    print(f'  Income        need predicted but NO compatible product: '
-          f'{int(inc_gap.sum())}')
-    print('\nBusiness insight: catalogue gap clients are actionable — the model '
-          'correctly\nidentified a need, but no product in the current catalogue '
-          'fits their risk\ntolerance.  This is a product line opportunity, not '
-          'a model limitation.')
-
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic plots
+# ---------------------------------------------------------------------------
+
+def plot_nba_diagnostics(nba: pd.DataFrame, products_df: pd.DataFrame) -> None:
+    """
+    Suitability scatter (client risk vs product risk) + recommendation frequency.
+
+    Parameters
+    ----------
+    nba         : DataFrame da generate_recommendations()
+    products_df : catalogo prodotti
+    """
+    sns.set_style('whitegrid')
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+
+    # ── Suitability scatter ───────────────────────────────────────────────
+    vis = nba[nba['Rec_Accum_ID'].notna() | nba['Rec_Income_ID'].notna()].copy()
+    vis['PickedRisk'] = vis['Rec_Accum_Risk'].fillna(vis['Rec_Income_Risk'])
+    vis['Head']       = np.where(vis['Rec_Accum_ID'].notna(), 'Accumulation', 'Income')
+
+    sns.scatterplot(ax=axes[0], data=vis, x='ClientRisk', y='PickedRisk',
+                    hue='Head', alpha=0.55, s=30,
+                    palette={'Accumulation': 'steelblue', 'Income': 'darkorange'})
+    max_r = float(max(vis['ClientRisk'].max(), vis['PickedRisk'].max()))
+    axes[0].plot([0, max_r], [0, max_r], 'r--', lw=1, alpha=0.6, label='risk = risk')
+    axes[0].set_title('Suitability: client risk vs recommended product risk')
+    axes[0].set_xlabel('Client risk propensity')
+    axes[0].set_ylabel('Recommended product risk')
+    axes[0].legend()
+
+    # ── Recommendation frequency ──────────────────────────────────────────
+    freq_acc = nba['Rec_Accum_ID'].dropna().astype(int).value_counts().sort_index()
+    freq_inc = nba['Rec_Income_ID'].dropna().astype(int).value_counts().sort_index()
+    freq = (pd.concat([freq_acc.rename('Accumulation'),
+                       freq_inc.rename('Income')], axis=1)
+              .fillna(0).astype(int))
+    freq.plot(kind='bar', ax=axes[1],
+              color=['steelblue', 'darkorange'], width=0.8)
+    axes[1].set_title('Recommendation frequency by product')
+    axes[1].set_xlabel('Product ID')
+    axes[1].set_ylabel('# recommendations')
+    axes[1].tick_params(axis='x', rotation=45)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def print_top_products(nba: pd.DataFrame, products_df: pd.DataFrame, k: int = 3) -> None:
+    """Top-k prodotti piu' raccomandati per ciascun head."""
+    freq_acc = nba['Rec_Accum_ID'].dropna().astype(int).value_counts()
+    freq_inc = nba['Rec_Income_ID'].dropna().astype(int).value_counts()
+
+    for freq, title in [(freq_acc, 'TOP ACCUMULATION'), (freq_inc, 'TOP INCOME')]:
+        print(f'\n=== {title} (top {k}) ===')
+        if freq.empty:
+            print('  (no recommendations emitted)')
+            continue
+        for pid in freq.nlargest(k).index:
+            risk = products_df.loc[products_df['IDProduct'] == pid, 'Risk'].iloc[0]
+            print(f'  ProductID {pid:<4} | Risk {risk:.3f} | '
+                  f'recommended to {int(freq[pid])} clients')

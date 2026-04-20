@@ -9,29 +9,28 @@ da NN/ — non sono duplicate qui.
 Mappa delle dipendenze
 ----------------------
 Feature engineering
-    prepare_features()           <- questo file (wrapper sottile)
-      chiama  NN.features.clean_and_engineer()   <- FONTE CANONICA
+    prepare_features()           <- wrapper sottile su NN.features.clean_and_engineer()
 
 Split + scaling
-    NN.features.prepare_model_data()             <- usa direttamente nel notebook
+    NN.features.prepare_model_data()  <- usata direttamente nel notebook
 
 Training DT
-    train_evaluate_dt()
-    display_results_table()
+    train_evaluate_dt(), display_results_table()
 
 Tuning DT
-    optimize_dt()                <- Optuna
+    optimize_dt()  <- Optuna
 
 SHAP / Permutation importance
     DT: build_explainers(), get_shap_pos(), get_base_val(), permutation_importance_dt()
     NN: usa NN.explain direttamente
 
-Recommendation
-    compute_score(), generate_recommendations(), analyse_coverage()
+Recommendation (allineata alla logica del notebook NN)
+    match_best_product(), generate_recommendations(),
+    analyse_coverage(), plot_nba_diagnostics(), print_top_products()
 
-Plotting
-    Tutte le plot_*() per il DT
-    ROC/PR curves: usa NN.evaluate.plot_test_curves() (condiviso)
+Plotting DT
+    tutte le plot_*() in plotting.py
+    ROC/PR: usa NN.evaluate.plot_test_curves()
 """
 
 from .data_loading        import load_data
@@ -40,6 +39,7 @@ from .model_utils         import train_evaluate_dt, display_results_table
 from .tuning              import optimize_dt
 from .shap_utils          import (build_explainers, get_shap_pos,
                                    get_base_val, permutation_importance_dt)
-from .recommendation      import (compute_score, generate_recommendations,
-                                   analyse_coverage)
+from .recommendation      import (match_best_product, generate_recommendations,
+                                   analyse_coverage, plot_nba_diagnostics,
+                                   print_top_products)
 from .plotting            import *
