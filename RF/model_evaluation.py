@@ -9,6 +9,7 @@ from sklearn.metrics import (
     recall_score,
     f1_score,
     average_precision_score,
+    roc_auc_score,
 )
 from tabulate import tabulate
 
@@ -111,6 +112,7 @@ def train_evaluate_model(
         "recall": [],
         "f1": [],
         "pr_auc": [],
+        "roc_auc": [],
     }
 
     # --- (a) Cross-validation on the training set ---
@@ -129,6 +131,7 @@ def train_evaluate_model(
         cv_metrics["recall"].append(recall_score(y_val_fold, y_val_pred))
         cv_metrics["f1"].append(f1_score(y_val_fold, y_val_pred))
         cv_metrics["pr_auc"].append(average_precision_score(y_val_fold, y_val_proba))
+        cv_metrics["roc_auc"].append(roc_auc_score(y_val_fold, y_val_proba))
 
     # --- (b) Final refit on the FULL training set and test evaluation ---
     # This is the model that gets returned and used downstream (NBA, etc.)
@@ -147,6 +150,7 @@ def train_evaluate_model(
             "recall": recall_score(y_test, y_test_pred),
             "f1": f1_score(y_test, y_test_pred),
             "pr_auc": average_precision_score(y_test, y_test_proba),
+            "roc_auc": roc_auc_score(y_test, y_test_proba),
         },
         "model": model,
     }
@@ -159,29 +163,14 @@ def display_results_table(results_dict, model_name, feature_type):
     Layout is intentionally the same for every call, so the notebook reads
     like a consistent evaluation report rather than ad-hoc printouts.
     """
+    metric_keys = ["accuracy", "precision", "recall", "f1", "pr_auc", "roc_auc"]
+    metric_labels = ["Accuracy", "Precision", "Recall", "F1", "PR-AUC", "ROC-AUC"]
+
     cv_data = {
-        "Metric": ["Accuracy", "Precision", "Recall", "F1", "PR-AUC"],
-        "CV Mean": [
-            results_dict["cv_metrics"]["accuracy"]["mean"],
-            results_dict["cv_metrics"]["precision"]["mean"],
-            results_dict["cv_metrics"]["recall"]["mean"],
-            results_dict["cv_metrics"]["f1"]["mean"],
-            results_dict["cv_metrics"]["pr_auc"]["mean"],
-        ],
-        "CV Std": [
-            results_dict["cv_metrics"]["accuracy"]["std"],
-            results_dict["cv_metrics"]["precision"]["std"],
-            results_dict["cv_metrics"]["recall"]["std"],
-            results_dict["cv_metrics"]["f1"]["std"],
-            results_dict["cv_metrics"]["pr_auc"]["std"],
-        ],
-        "Test Set": [
-            results_dict["test_metrics"]["accuracy"],
-            results_dict["test_metrics"]["precision"],
-            results_dict["test_metrics"]["recall"],
-            results_dict["test_metrics"]["f1"],
-            results_dict["test_metrics"]["pr_auc"],
-        ],
+        "Metric": metric_labels,
+        "CV Mean": [results_dict["cv_metrics"][k]["mean"] for k in metric_keys],
+        "CV Std": [results_dict["cv_metrics"][k]["std"] for k in metric_keys],
+        "Test Set": [results_dict["test_metrics"][k] for k in metric_keys],
     }
 
     # Round to 4 decimals: enough to see differences between models without
